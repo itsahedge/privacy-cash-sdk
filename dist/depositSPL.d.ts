@@ -1,6 +1,6 @@
-import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import * as hasher from '@lightprotocol/hasher.rs';
-import { EncryptionService } from './utils/encryption.js';
+import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import * as hasher from "@lightprotocol/hasher.rs";
+import { EncryptionService } from "./utils/encryption.js";
 type DepositParams = {
     mintAddress: PublicKey;
     publicKey: PublicKey;
@@ -13,7 +13,7 @@ type DepositParams = {
     referrer?: string;
     transactionSigner: (tx: VersionedTransaction) => Promise<VersionedTransaction>;
 };
-export declare function depositSPL({ lightWasm, storage, keyBasePath, publicKey, connection, base_units, encryptionService, transactionSigner, referrer, mintAddress }: DepositParams): Promise<{
+export declare function depositSPL({ lightWasm, storage, keyBasePath, publicKey, connection, base_units, encryptionService, transactionSigner, referrer, mintAddress, }: DepositParams): Promise<{
     tx: string;
 }>;
 /**
@@ -55,7 +55,7 @@ type DepositSPLV2Params = {
     referrer?: string;
     transactionSigner: (tx: VersionedTransaction) => Promise<VersionedTransaction>;
 };
-export declare function depositSPLV2({ lightWasm, storage, keyBasePath, publicKey, connection, totalBaseUnits, feeBaseUnits, feeRecipient, encryptionService, transactionSigner, referrer, mintAddress }: DepositSPLV2Params): Promise<{
+export declare function depositSPLV2({ lightWasm, storage, keyBasePath, publicKey, connection, totalBaseUnits, feeBaseUnits, feeRecipient, encryptionService, transactionSigner, referrer, mintAddress, }: DepositSPLV2Params): Promise<{
     tx: string;
     depositBaseUnits: number;
     feeBaseUnits: number;
