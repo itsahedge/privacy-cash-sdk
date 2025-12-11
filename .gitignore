@@ -43,5 +43,5 @@ yarn-error.log*
 *.tsbuildinfo
 /dev
 /cache
-/dist
+
 yarn.lock
