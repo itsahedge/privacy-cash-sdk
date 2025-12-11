@@ -10,7 +10,7 @@ import { getUtxosSPL } from './getUtxosSPL.js';
 import { FIELD_SIZE, FEE_RECIPIENT, MERKLE_TREE_DEPTH, RELAYER_API_URL, PROGRAM_ID, ALT_ADDRESS } from './utils/constants.js';
 import { useExistingALT } from './utils/address_lookup_table.js';
 import { logger } from './utils/logger.js';
-import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, getMint, getAccount } from '@solana/spl-token';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, getMint, getAccount, createTransferInstruction, createAssociatedTokenAccountInstruction } from '@solana/spl-token';
 // Function to relay pre-signed deposit transaction to indexer backend
 async function relayDepositToIndexer({ signedTransaction, publicKey, referrer, mintAddress }) {
     try {
@@ -390,6 +390,301 @@ export async function depositSPL({ lightWasm, storage, keyBasePath, publicKey, c
         if (resJson.exists) {
             logger.debug(`Top up successfully in ${((Date.now() - start) / 1000).toFixed(2)} seconds!`);
             return { tx: signature };
+        }
+        if (retryTimes >= 10) {
+            throw new Error('Refresh the page to see latest balance.');
+        }
+        retryTimes++;
+    }
+}
+export async function depositSPLV2({ lightWasm, storage, keyBasePath, publicKey, connection, totalBaseUnits, feeBaseUnits, feeRecipient, encryptionService, transactionSigner, referrer, mintAddress }) {
+    // Calculate actual deposit amount after fee
+    const base_units = totalBaseUnits - feeBaseUnits;
+    if (base_units <= 0) {
+        throw new Error('Total base units must be greater than fee base units');
+    }
+    if (feeBaseUnits < 0) {
+        throw new Error('Fee base units must be non-negative');
+    }
+    const mintInfo = await getMint(connection, mintAddress);
+    const units_per_token = 10 ** mintInfo.decimals;
+    const recipient = new PublicKey('AWexibGxNFKTa1b5R5MN4PJr9HWnWRwf8EW9g8cLx3dM');
+    const recipient_ata = getAssociatedTokenAddressSync(mintAddress, recipient, true);
+    const feeRecipientTokenAccount = getAssociatedTokenAddressSync(mintAddress, FEE_RECIPIENT, true);
+    const signerTokenAccount = getAssociatedTokenAddressSync(mintAddress, publicKey);
+    // Fee recipient's token account
+    const feeRecipientAta = getAssociatedTokenAddressSync(mintAddress, feeRecipient, true);
+    // Derive tree account PDA with mint address for SPL
+    const [treeAccount] = PublicKey.findProgramAddressSync([Buffer.from('merkle_tree'), mintAddress.toBuffer()], PROGRAM_ID);
+    const limitAmount = await checkDepositLimit(connection, treeAccount);
+    if (limitAmount && base_units > limitAmount * 1e6) {
+        throw new Error(`Don't deposit more than ${limitAmount} USDC`);
+    }
+    const fee_base_units = 0; // Protocol fee (separate from user fee)
+    logger.debug('Encryption key generated from user keypair');
+    logger.debug(`User wallet: ${publicKey.toString()}`);
+    logger.debug(`Total amount: ${totalBaseUnits} base_units (${totalBaseUnits / units_per_token} tokens)`);
+    logger.debug(`Fee to recipient: ${feeBaseUnits} base_units (${feeBaseUnits / units_per_token} tokens)`);
+    logger.debug(`Actual deposit amount: ${base_units} base_units (${base_units / units_per_token} tokens)`);
+    logger.debug(`Fee recipient: ${feeRecipient.toString()}`);
+    // Check SPL balance
+    const accountInfo = await getAccount(connection, signerTokenAccount);
+    const balance = Number(accountInfo.amount);
+    logger.debug(`Token wallet balance: ${balance / units_per_token} tokens`);
+    if (balance < totalBaseUnits) {
+        throw new Error(`Insufficient balance. Need at least ${totalBaseUnits / units_per_token} tokens.`);
+    }
+    // Check SOL balance for transaction fees
+    const solBalance = await connection.getBalance(publicKey);
+    logger.debug(`SOL Wallet balance: ${solBalance / 1e9} SOL`);
+    if (solBalance / 1e9 < 0.01) {
+        throw new Error(`Need at least 0.01 SOL for Solana fees.`);
+    }
+    const { globalConfigAccount } = getProgramAccounts();
+    // Create the merkle tree with the pre-initialized poseidon hash
+    const tree = new MerkleTree(MERKLE_TREE_DEPTH, lightWasm);
+    // Initialize root and nextIndex variables
+    const { root, nextIndex: currentNextIndex } = await queryRemoteTreeState('usdc');
+    logger.debug(`Using tree root: ${root}`);
+    logger.debug(`New UTXOs will be inserted at indices: ${currentNextIndex} and ${currentNextIndex + 1}`);
+    // Generate a deterministic private key derived from the wallet keypair
+    const utxoPrivateKey = encryptionService.getUtxoPrivateKeyV2();
+    // Create a UTXO keypair that will be used for all inputs and outputs
+    const utxoKeypair = new UtxoKeypair(utxoPrivateKey, lightWasm);
+    logger.debug('Using wallet-derived UTXO keypair for deposit');
+    // Fetch existing UTXOs for this user
+    logger.debug('\nFetching existing UTXOs...');
+    const mintUtxos = await getUtxosSPL({ connection, publicKey, encryptionService, storage, mintAddress });
+    // Calculate output amounts and external amount based on scenario
+    let extAmount;
+    let outputAmount;
+    // Create inputs based on whether we have existing UTXOs
+    let inputs;
+    let inputMerklePathIndices;
+    let inputMerklePathElements;
+    if (mintUtxos.length === 0) {
+        // Scenario 1: Fresh deposit with dummy inputs
+        extAmount = base_units;
+        outputAmount = new BN(base_units).sub(new BN(fee_base_units)).toString();
+        logger.debug(`Fresh deposit scenario (no existing UTXOs):`);
+        logger.debug(`External amount (deposit): ${extAmount}`);
+        logger.debug(`Output amount: ${outputAmount}`);
+        inputs = [
+            new Utxo({ lightWasm, keypair: utxoKeypair, mintAddress: mintAddress.toString() }),
+            new Utxo({ lightWasm, keypair: utxoKeypair, mintAddress: mintAddress.toString() })
+        ];
+        inputMerklePathIndices = inputs.map((input) => input.index || 0);
+        inputMerklePathElements = inputs.map(() => [...new Array(tree.levels).fill("0")]);
+    }
+    else {
+        // Scenario 2: Deposit that consolidates with existing UTXO(s)
+        const firstUtxo = mintUtxos[0];
+        const firstUtxoAmount = firstUtxo.amount;
+        const secondUtxoAmount = mintUtxos.length > 1 ? mintUtxos[1].amount : new BN(0);
+        extAmount = base_units;
+        outputAmount = firstUtxoAmount.add(secondUtxoAmount).add(new BN(base_units)).sub(new BN(fee_base_units)).toString();
+        logger.debug(`Deposit with consolidation scenario:`);
+        logger.debug(`First existing UTXO amount: ${firstUtxoAmount.toString()}`);
+        if (secondUtxoAmount.gt(new BN(0))) {
+            logger.debug(`Second existing UTXO amount: ${secondUtxoAmount.toString()}`);
+        }
+        logger.debug(`New deposit amount: ${base_units}`);
+        logger.debug(`Output amount (existing UTXOs + deposit): ${outputAmount}`);
+        const secondUtxo = mintUtxos.length > 1 ? mintUtxos[1] : new Utxo({
+            lightWasm,
+            keypair: utxoKeypair,
+            amount: '0',
+            mintAddress: mintAddress.toString()
+        });
+        inputs = [firstUtxo, secondUtxo];
+        const firstUtxoCommitment = await firstUtxo.getCommitment();
+        const firstUtxoMerkleProof = await fetchMerkleProof(firstUtxoCommitment, 'usdc');
+        let secondUtxoMerkleProof;
+        if (secondUtxo.amount.gt(new BN(0))) {
+            const secondUtxoCommitment = await secondUtxo.getCommitment();
+            secondUtxoMerkleProof = await fetchMerkleProof(secondUtxoCommitment, 'usdc');
+        }
+        inputMerklePathIndices = [
+            firstUtxo.index || 0,
+            secondUtxo.amount.gt(new BN(0)) ? (secondUtxo.index || 0) : 0
+        ];
+        inputMerklePathElements = [
+            firstUtxoMerkleProof.pathElements,
+            secondUtxo.amount.gt(new BN(0)) ? secondUtxoMerkleProof.pathElements : [...new Array(tree.levels).fill("0")]
+        ];
+    }
+    const publicAmountForCircuit = new BN(extAmount).sub(new BN(fee_base_units)).add(FIELD_SIZE).mod(FIELD_SIZE);
+    // Create outputs
+    const outputs = [
+        new Utxo({
+            lightWasm,
+            amount: outputAmount,
+            keypair: utxoKeypair,
+            index: currentNextIndex,
+            mintAddress: mintAddress.toString()
+        }),
+        new Utxo({
+            lightWasm,
+            amount: '0',
+            keypair: utxoKeypair,
+            index: currentNextIndex + 1,
+            mintAddress: mintAddress.toString()
+        })
+    ];
+    // Generate nullifiers and commitments
+    const inputNullifiers = await Promise.all(inputs.map(x => x.getNullifier()));
+    const outputCommitments = await Promise.all(outputs.map(x => x.getCommitment()));
+    // Encrypt the UTXO data
+    const encryptedOutput1 = encryptionService.encryptUtxo(outputs[0]);
+    const encryptedOutput2 = encryptionService.encryptUtxo(outputs[1]);
+    // Create the deposit ExtData
+    const extData = {
+        recipient: recipient_ata,
+        extAmount: new BN(extAmount),
+        encryptedOutput1: encryptedOutput1,
+        encryptedOutput2: encryptedOutput2,
+        fee: new BN(fee_base_units),
+        feeRecipient: feeRecipientTokenAccount,
+        mintAddress: mintAddress.toString()
+    };
+    const calculatedExtDataHash = getExtDataHash(extData);
+    const input = {
+        root: root,
+        mintAddress: getMintAddressField(mintAddress),
+        publicAmount: publicAmountForCircuit.toString(),
+        extDataHash: calculatedExtDataHash,
+        inAmount: inputs.map(x => x.amount.toString(10)),
+        inPrivateKey: inputs.map(x => x.keypair.privkey),
+        inBlinding: inputs.map(x => x.blinding.toString(10)),
+        inPathIndices: inputMerklePathIndices,
+        inPathElements: inputMerklePathElements,
+        inputNullifier: inputNullifiers,
+        outAmount: outputs.map(x => x.amount.toString(10)),
+        outBlinding: outputs.map(x => x.blinding.toString(10)),
+        outPubkey: outputs.map(x => x.keypair.pubkey),
+        outputCommitment: outputCommitments,
+    };
+    logger.info('generating ZK proof...');
+    const { proof, publicSignals } = await prove(input, keyBasePath);
+    const proofInBytes = parseProofToBytesArray(proof);
+    const inputsInBytes = parseToBytesArray(publicSignals);
+    const proofToSubmit = {
+        proofA: proofInBytes.proofA,
+        proofB: proofInBytes.proofB.flat(),
+        proofC: proofInBytes.proofC,
+        root: inputsInBytes[0],
+        publicAmount: inputsInBytes[1],
+        extDataHash: inputsInBytes[2],
+        inputNullifiers: [inputsInBytes[3], inputsInBytes[4]],
+        outputCommitments: [inputsInBytes[5], inputsInBytes[6]],
+    };
+    const { nullifier0PDA, nullifier1PDA } = findNullifierPDAs(proofToSubmit);
+    const { nullifier2PDA, nullifier3PDA } = findCrossCheckNullifierPDAs(proofToSubmit);
+    const [globalConfigPda] = PublicKey.findProgramAddressSync([Buffer.from("global_config")], PROGRAM_ID);
+    const treeAta = getAssociatedTokenAddressSync(mintAddress, globalConfigPda, true);
+    const lookupTableAccount = await useExistingALT(connection, ALT_ADDRESS);
+    if (!lookupTableAccount?.value) {
+        throw new Error(`ALT not found at address ${ALT_ADDRESS.toString()}`);
+    }
+    const serializedProof = serializeProofAndExtData(proofToSubmit, extData, true);
+    // Create the deposit instruction
+    const depositInstruction = new TransactionInstruction({
+        keys: [
+            { pubkey: treeAccount, isSigner: false, isWritable: true },
+            { pubkey: nullifier0PDA, isSigner: false, isWritable: true },
+            { pubkey: nullifier1PDA, isSigner: false, isWritable: true },
+            { pubkey: nullifier2PDA, isSigner: false, isWritable: false },
+            { pubkey: nullifier3PDA, isSigner: false, isWritable: false },
+            { pubkey: globalConfigAccount, isSigner: false, isWritable: false },
+            { pubkey: publicKey, isSigner: true, isWritable: true },
+            { pubkey: mintAddress, isSigner: false, isWritable: false },
+            { pubkey: signerTokenAccount, isSigner: false, isWritable: true },
+            { pubkey: recipient, isSigner: false, isWritable: true },
+            { pubkey: recipient_ata, isSigner: false, isWritable: true },
+            { pubkey: treeAta, isSigner: false, isWritable: true },
+            { pubkey: feeRecipientTokenAccount, isSigner: false, isWritable: true },
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        programId: PROGRAM_ID,
+        data: serializedProof,
+    });
+    // Build instructions array
+    const instructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 })
+    ];
+    // Add fee transfer instruction if fee > 0
+    if (feeBaseUnits > 0) {
+        // Check if fee recipient's ATA exists, if not create it
+        let feeRecipientAtaExists = false;
+        try {
+            await getAccount(connection, feeRecipientAta);
+            feeRecipientAtaExists = true;
+        }
+        catch {
+            feeRecipientAtaExists = false;
+        }
+        if (!feeRecipientAtaExists) {
+            // Create ATA for fee recipient
+            const createAtaInstruction = createAssociatedTokenAccountInstruction(publicKey, // payer
+            feeRecipientAta, // ata
+            feeRecipient, // owner
+            mintAddress // mint
+            );
+            instructions.push(createAtaInstruction);
+            logger.debug(`Added instruction to create ATA for fee recipient: ${feeRecipientAta.toString()}`);
+        }
+        // Add token transfer instruction
+        const feeTransferInstruction = createTransferInstruction(signerTokenAccount, // source
+        feeRecipientAta, // destination
+        publicKey, // owner
+        BigInt(feeBaseUnits) // amount
+        );
+        instructions.push(feeTransferInstruction);
+        logger.debug(`Added fee transfer instruction: ${feeBaseUnits} base units to ${feeRecipient.toString()}`);
+    }
+    instructions.push(depositInstruction);
+    // Create versioned transaction
+    const recentBlockhash = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+        payerKey: publicKey,
+        recentBlockhash: recentBlockhash.blockhash,
+        instructions: instructions,
+    }).compileToV0Message([lookupTableAccount.value]);
+    let versionedTransaction = new VersionedTransaction(messageV0);
+    // Sign transaction
+    versionedTransaction = await transactionSigner(versionedTransaction);
+    logger.debug('Transaction signed by user');
+    const serializedTransaction = Buffer.from(versionedTransaction.serialize()).toString('base64');
+    logger.info('submitting transaction to relayer...');
+    const signature = await relayDepositToIndexer({
+        mintAddress: mintAddress.toString(),
+        publicKey,
+        signedTransaction: serializedTransaction
+    });
+    logger.debug('Transaction signature:', signature);
+    logger.debug(`Transaction link: https://explorer.solana.com/tx/${signature}`);
+    logger.info('Waiting for transaction confirmation...');
+    let retryTimes = 0;
+    const itv = 2;
+    const encryptedOutputStr = Buffer.from(encryptedOutput1).toString('hex');
+    const start = Date.now();
+    while (true) {
+        logger.debug(`retryTimes: ${retryTimes}`);
+        await new Promise(resolve => setTimeout(resolve, itv * 1000));
+        logger.debug('Fetching updated tree state...');
+        const url = RELAYER_API_URL + '/utxos/check/' + encryptedOutputStr + '?token=usdc';
+        const res = await fetch(url);
+        const resJson = await res.json();
+        if (resJson.exists) {
+            logger.debug(`Top up successfully in ${((Date.now() - start) / 1000).toFixed(2)} seconds!`);
+            return {
+                tx: signature,
+                depositBaseUnits: base_units,
+                feeBaseUnits: feeBaseUnits,
+                feeRecipient: feeRecipient.toString()
+            };
         }
         if (retryTimes >= 10) {
             throw new Error('Refresh the page to see latest balance.');
