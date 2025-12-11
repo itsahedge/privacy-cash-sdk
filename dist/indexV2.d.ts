@@ -212,6 +212,45 @@ export declare class PrivacyCashV2 {
         tx: string;
     }>;
     /**
+     * Deposit SPL tokens (USDC) to Privacy Cash with fee transfer in the same transaction.
+     *
+     * This method allows you to deposit SPL tokens while also transferring a fee to a
+     * specified recipient in a single atomic transaction.
+     *
+     * @param options.totalBaseUnits - Total amount (fee + deposit) in base units. The actual deposit will be totalBaseUnits - feeBaseUnits
+     * @param options.feeBaseUnits - Fee amount to transfer to feeRecipient in base units
+     * @param options.feeRecipient - Address to receive the fee (string or PublicKey)
+     * @param options.mintAddress - Optional SPL token mint address. Defaults to USDC.
+     * @param options.referrer - Optional referrer wallet address
+     * @returns Transaction result with signature and breakdown of amounts
+     *
+     * @example
+     * ```typescript
+     * // Deposit 100 USDC with 2 USDC fee
+     * // Result: 2 USDC to fee address, 98 USDC deposited privately
+     * const result = await client.depositSPLV2({
+     *     totalBaseUnits: 100 * 1_000_000,   // 100 USDC total
+     *     feeBaseUnits: 2 * 1_000_000,       // 2 USDC fee
+     *     feeRecipient: 'FeeRecipientAddress...'
+     * });
+     * console.log('Transaction:', result.tx);
+     * console.log('Deposited:', result.depositBaseUnits / 1e6, 'USDC');
+     * console.log('Fee paid:', result.feeBaseUnits / 1e6, 'USDC');
+     * ```
+     */
+    depositSPLV2({ totalBaseUnits, feeBaseUnits, feeRecipient, mintAddress, referrer, }: {
+        totalBaseUnits: number;
+        feeBaseUnits: number;
+        feeRecipient: string | PublicKey;
+        mintAddress?: PublicKey;
+        referrer?: string;
+    }): Promise<{
+        tx: string;
+        depositBaseUnits: number;
+        feeBaseUnits: number;
+        feeRecipient: string;
+    }>;
+    /**
      * Withdraw SPL tokens (USDC) from Privacy Cash.
      *
      * @param options.baseUnits - Amount in base units to withdraw (e.g., 1 USDC = 1_000_000 base units)

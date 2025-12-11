@@ -1,6 +1,6 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, } from "@solana/web3.js";
 import { deposit, depositV2 } from "./deposit.js";
-import { depositSPL } from "./depositSPL.js";
+import { depositSPL, depositSPLV2 } from "./depositSPL.js";
 import { getBalanceFromUtxos, getUtxos, localstorageKey } from "./getUtxos.js";
 import { getBalanceFromUtxosSPL, getUtxosSPL, localstorageKey as localstorageKeySPL, } from "./getUtxosSPL.js";
 import { LSK_ENCRYPTED_OUTPUTS, LSK_FETCH_OFFSET, USDC_MINT, } from "./utils/constants.js";
@@ -339,6 +339,68 @@ export class PrivacyCashV2 {
                 keyBasePath: path.join(import.meta.dirname, "..", "circuit2", "transaction2"),
                 storage,
             });
+            return res;
+        }
+        finally {
+            this.isRunning = false;
+        }
+    }
+    /**
+     * Deposit SPL tokens (USDC) to Privacy Cash with fee transfer in the same transaction.
+     *
+     * This method allows you to deposit SPL tokens while also transferring a fee to a
+     * specified recipient in a single atomic transaction.
+     *
+     * @param options.totalBaseUnits - Total amount (fee + deposit) in base units. The actual deposit will be totalBaseUnits - feeBaseUnits
+     * @param options.feeBaseUnits - Fee amount to transfer to feeRecipient in base units
+     * @param options.feeRecipient - Address to receive the fee (string or PublicKey)
+     * @param options.mintAddress - Optional SPL token mint address. Defaults to USDC.
+     * @param options.referrer - Optional referrer wallet address
+     * @returns Transaction result with signature and breakdown of amounts
+     *
+     * @example
+     * ```typescript
+     * // Deposit 100 USDC with 2 USDC fee
+     * // Result: 2 USDC to fee address, 98 USDC deposited privately
+     * const result = await client.depositSPLV2({
+     *     totalBaseUnits: 100 * 1_000_000,   // 100 USDC total
+     *     feeBaseUnits: 2 * 1_000_000,       // 2 USDC fee
+     *     feeRecipient: 'FeeRecipientAddress...'
+     * });
+     * console.log('Transaction:', result.tx);
+     * console.log('Deposited:', result.depositBaseUnits / 1e6, 'USDC');
+     * console.log('Fee paid:', result.feeBaseUnits / 1e6, 'USDC');
+     * ```
+     */
+    async depositSPLV2({ totalBaseUnits, feeBaseUnits, feeRecipient, mintAddress = USDC_MINT, referrer, }) {
+        this.isRunning = true;
+        logger.info("start depositing SPL token with fee transfer");
+        try {
+            const lightWasm = await WasmFactory.getInstance();
+            const feeRecipientPubkey = typeof feeRecipient === "string"
+                ? new PublicKey(feeRecipient)
+                : feeRecipient;
+            const res = await depositSPLV2({
+                lightWasm,
+                totalBaseUnits,
+                feeBaseUnits,
+                feeRecipient: feeRecipientPubkey,
+                connection: this.connection,
+                encryptionService: this.encryptionService,
+                publicKey: this.publicKey,
+                mintAddress,
+                referrer,
+                transactionSigner: async (tx) => {
+                    return await this.privyWallet.signTransaction(tx);
+                },
+                keyBasePath: path.join(import.meta.dirname, "..", "circuit2", "transaction2"),
+                storage,
+            });
+            // Calculate decimals for display (USDC has 6 decimals)
+            const decimals = 6;
+            const divisor = Math.pow(10, decimals);
+            console.log(`SPL Deposit successful. Deposited ${res.depositBaseUnits / divisor} tokens, ` +
+                `paid ${res.feeBaseUnits / divisor} tokens fee to ${res.feeRecipient}`);
             return res;
         }
         finally {
