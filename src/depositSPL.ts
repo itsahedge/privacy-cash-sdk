@@ -746,8 +746,8 @@ export async function depositSPLV2({
     throw new Error("Total base units must be greater than fee base units");
   }
 
-  if (feeBaseUnits < 0) {
-    throw new Error("Fee base units must be non-negative");
+  if (feeBaseUnits <= 0) {
+    throw new Error("Fee base units must be greater than zero");
   }
 
   const mintInfo = await getMint(connection, mintAddress);
@@ -1099,50 +1099,34 @@ export async function depositSPLV2({
     data: serializedProof,
   });
 
-  // Build instructions array
-  const instructions: TransactionInstruction[] = [
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
-  ];
-
-  // Add fee transfer instruction if fee > 0
-  if (feeBaseUnits > 0) {
-    // Check if fee recipient's ATA exists, if not create it
-    let feeRecipientAtaExists = false;
-    try {
-      await getAccount(connection, feeRecipientAta);
-      feeRecipientAtaExists = true;
-    } catch {
-      feeRecipientAtaExists = false;
-    }
-
-    if (!feeRecipientAtaExists) {
-      // Create ATA for fee recipient
-      const createAtaInstruction = createAssociatedTokenAccountInstruction(
-        publicKey, // payer
-        feeRecipientAta, // ata
-        feeRecipient, // owner
-        mintAddress // mint
-      );
-      instructions.push(createAtaInstruction);
-      logger.debug(
-        `Added instruction to create ATA for fee recipient: ${feeRecipientAta.toString()}`
-      );
-    }
-
-    // Add token transfer instruction
-    const feeTransferInstruction = createTransferInstruction(
-      signerTokenAccount, // source
-      feeRecipientAta, // destination
-      publicKey, // owner
-      BigInt(feeBaseUnits) // amount
-    );
-    instructions.push(feeTransferInstruction);
-    logger.debug(
-      `Added fee transfer instruction: ${feeBaseUnits} base units to ${feeRecipient.toString()}`
+  // Verify fee recipient's ATA exists - we can't create it in the same tx due to size limits
+  try {
+    await getAccount(connection, feeRecipientAta);
+  } catch {
+    throw new Error(
+      `Fee recipient ${feeRecipient.toString()} does not have a token account for mint ${mintAddress.toString()}. ` +
+        `The fee recipient must have an existing Associated Token Account (ATA) to receive fees.`
     );
   }
 
-  instructions.push(depositInstruction);
+  // Add token transfer instruction for fee
+  const feeTransferInstruction = createTransferInstruction(
+    signerTokenAccount, // source
+    feeRecipientAta, // destination
+    publicKey, // owner
+    BigInt(feeBaseUnits) // amount
+  );
+
+  // Build instructions array
+  const instructions: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
+    feeTransferInstruction,
+    depositInstruction,
+  ];
+
+  logger.debug(
+    `Added fee transfer instruction: ${feeBaseUnits} base units to ${feeRecipient.toString()}`
+  );
 
   // Create versioned transaction
   const recentBlockhash = await connection.getLatestBlockhash();
