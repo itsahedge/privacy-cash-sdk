@@ -1,0 +1,16 @@
+import { PublicKey } from '@solana/web3.js';
+import BN from 'bn.js';
+export declare const FIELD_SIZE: BN;
+export declare const PROGRAM_ID: PublicKey;
+export declare const DEPLOYER_ID: PublicKey;
+export declare const FEE_RECIPIENT: PublicKey;
+export declare const FETCH_UTXOS_GROUP_SIZE = 10000;
+export declare const TRANSACT_IX_DISCRIMINATOR: Buffer<ArrayBuffer>;
+export declare const TRANSACT_SPL_IX_DISCRIMINATOR: Buffer<ArrayBuffer>;
+export declare const MERKLE_TREE_DEPTH = 26;
+export declare const ALT_ADDRESS: PublicKey;
+export declare const RELAYER_API_URL: string;
+export declare const SIGN_MESSAGE = "Privacy Money account sign in";
+export declare const LSK_FETCH_OFFSET = "fetch_offset";
+export declare const LSK_ENCRYPTED_OUTPUTS = "encrypted_outputs";
+export declare const USDC_MINT: PublicKey;
