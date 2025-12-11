@@ -4,7 +4,7 @@ import {
   PublicKey,
   VersionedTransaction,
 } from "@solana/web3.js";
-import { deposit } from "./deposit.js";
+import { deposit, depositV2 } from "./deposit.js";
 import { depositSPL } from "./depositSPL.js";
 import { getBalanceFromUtxos, getUtxos, localstorageKey } from "./getUtxos.js";
 import {
@@ -235,6 +235,94 @@ export class PrivacyCashV2 {
         ),
         storage,
       });
+      return res;
+    } finally {
+      this.isRunning = false;
+    }
+  }
+
+  /**
+   * Deposit SOL to Privacy Cash with fee transfer in the same transaction.
+   *
+   * This method allows you to deposit SOL while also transferring a fee to a
+   * specified recipient in a single atomic transaction.
+   *
+   * @param options.totalLamports - Total amount (fee + deposit). The actual deposit will be totalLamports - feeLamports
+   * @param options.feeLamports - Fee amount to transfer to feeRecipient
+   * @param options.feeRecipient - Address to receive the fee (string or PublicKey)
+   * @param options.referrer - Optional referrer wallet address
+   * @returns Transaction result with signature and breakdown of amounts
+   *
+   * @example
+   * ```typescript
+   * // Deposit 1 SOL with 0.02 SOL fee
+   * // Result: 0.02 SOL to fee address, 0.98 SOL deposited privately
+   * const result = await client.depositV2({
+   *     totalLamports: 1 * 1_000_000_000,
+   *     feeLamports: 0.02 * 1_000_000_000,
+   *     feeRecipient: 'FeeRecipientAddress...'
+   * });
+   * console.log('Transaction:', result.tx);
+   * console.log('Deposited:', result.depositLamports / 1e9, 'SOL');
+   * console.log('Fee paid:', result.feeLamports / 1e9, 'SOL');
+   * ```
+   */
+  async depositV2({
+    totalLamports,
+    feeLamports,
+    feeRecipient,
+    referrer,
+  }: {
+    totalLamports: number;
+    feeLamports: number;
+    feeRecipient: string | PublicKey;
+    referrer?: string;
+  }): Promise<{
+    tx: string;
+    depositLamports: number;
+    feeLamports: number;
+    feeRecipient: string;
+  }> {
+    this.isRunning = true;
+    logger.info("start depositing with fee transfer");
+
+    try {
+      const lightWasm = await WasmFactory.getInstance();
+      const feeRecipientPubkey =
+        typeof feeRecipient === "string"
+          ? new PublicKey(feeRecipient)
+          : feeRecipient;
+
+      const res = await depositV2({
+        lightWasm,
+        totalLamports,
+        feeLamports,
+        feeRecipient: feeRecipientPubkey,
+        connection: this.connection,
+        encryptionService: this.encryptionService,
+        publicKey: this.publicKey,
+        referrer,
+        transactionSigner: async (tx: VersionedTransaction) => {
+          return await this.privyWallet.signTransaction(tx);
+        },
+        keyBasePath: path.join(
+          import.meta.dirname,
+          "..",
+          "circuit2",
+          "transaction2"
+        ),
+        storage,
+      });
+
+      console.log(
+        `Deposit successful. Deposited ${
+          res.depositLamports / LAMPORTS_PER_SOL
+        } SOL, ` +
+          `paid ${res.feeLamports / LAMPORTS_PER_SOL} SOL fee to ${
+            res.feeRecipient
+          }`
+      );
+
       return res;
     } finally {
       this.isRunning = false;
